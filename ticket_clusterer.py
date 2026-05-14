@@ -3,90 +3,141 @@ from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
+import joblib
+import os
 
-def cluster_tickets(csv_path, description_column='short_description', n_clusters=5):
+class TicketClusterer:
     """
-    Clusters tickets from a CSV file based on their descriptions.
-
-    Args:
-        csv_path (str): The path to the CSV file.
-        description_column (str): The name of the column containing the ticket descriptions.
-        n_clusters (int): The number of clusters to create.
-
-    Returns:
-        pd.DataFrame: A pandas DataFrame with the original data and a new 'cluster' column.
+    A class to cluster ServiceNow tickets based on their descriptions.
     """
-    # Load the data
-    try:
-        df = pd.read_csv(csv_path)
-    except FileNotFoundError:
-        print(f"Error: The file '{csv_path}' was not found.")
-        return None
-    except Exception as e:
-        print(f"An error occurred while reading the CSV file: {e}")
-        return None
+    def __init__(self, n_clusters=12, model_name='all-MiniLM-L6-v2'):
+        """
+        Initializes the TicketClusterer.
 
-    if description_column not in df.columns:
-        print(f"Error: The CSV file must have a '{description_column}' column.")
-        return None
+        Args:
+            n_clusters (int): The number of clusters to create.
+            model_name (str): The name of the sentence transformer model to use.
+        """
+        self.n_clusters = n_clusters
+        self.model = SentenceTransformer(model_name)
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init='auto')
+        self.vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
+        self.cluster_names = {}
 
-    # Load a pre-trained model
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    def fit(self, descriptions):
+        """
+        Fits the clustering model to the given descriptions.
 
-    # Generate embeddings for the ticket descriptions
-    descriptions = df[description_column].tolist()
-    embeddings = model.encode(descriptions, show_progress_bar=False)
+        Args:
+            descriptions (list): A list of ticket descriptions.
+        """
+        embeddings = self.model.encode(descriptions, show_progress_bar=False)
+        self.kmeans.fit(embeddings)
+        # Generate cluster names after fitting
+        self._generate_cluster_names(descriptions, self.kmeans.labels_)
 
-    # Cluster the embeddings
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-    df['cluster'] = kmeans.fit_predict(embeddings)
+    def predict(self, descriptions):
+        """
+        Predicts the cluster for new descriptions.
 
-    return df
+        Args:
+            descriptions (list): A list of new ticket descriptions.
 
-def generate_cluster_names(clustered_df, n_words=2):
-    """Generates names for each cluster based on TF-IDF."""
-    # Combine descriptions for each cluster into a single string
-    docs_per_cluster = clustered_df.groupby('cluster')['short_description'].apply(' '.join)
+        Returns:
+            np.ndarray: The predicted cluster labels.
+        """
+        embeddings = self.model.encode(descriptions, show_progress_bar=False)
+        return self.kmeans.predict(embeddings)
 
-    # Use TF-IDF to find important words
-    vectorizer = TfidfVectorizer(stop_words='english', max_features=1000)
-    tfidf_matrix = vectorizer.fit_transform(docs_per_cluster)
-    
-    # Get feature names (the words)
-    feature_names = np.array(vectorizer.get_feature_names_out())
+    def fit_predict(self, descriptions):
+        """
+        Fits the model and predicts the clusters for the given descriptions.
 
-    cluster_names = {}
-    for i, r in enumerate(tfidf_matrix):
-        # Get the indices of the top n_words for this cluster
-        top_word_indices = r.toarray().argsort()[0, -n_words:][::-1]
-        top_words = feature_names[top_word_indices]
-        cluster_names[docs_per_cluster.index[i]] = " - ".join(top_words)
+        Args:
+            descriptions (list): A list of ticket descriptions.
 
-    return cluster_names
+        Returns:
+            np.ndarray: The predicted cluster labels.
+        """
+        embeddings = self.model.encode(descriptions, show_progress_bar=False)
+        labels = self.kmeans.fit_predict(embeddings)
+        # Generate cluster names after fitting
+        self._generate_cluster_names(descriptions, labels)
+        return labels
 
+    def _generate_cluster_names(self, descriptions, labels, n_words=2):
+        """Generates names for each cluster based on TF-IDF."""
+        df = pd.DataFrame({'description': descriptions, 'cluster': labels})
+        docs_per_cluster = df.groupby('cluster')['description'].apply(' '.join)
+        
+        tfidf_matrix = self.vectorizer.fit_transform(docs_per_cluster)
+        feature_names = np.array(self.vectorizer.get_feature_names_out())
+
+        for i, r in enumerate(tfidf_matrix):
+            top_word_indices = r.toarray().argsort()[0, -n_words:][::-1]
+            top_words = feature_names[top_word_indices]
+            self.cluster_names[docs_per_cluster.index[i]] = " - ".join(top_words)
+
+    def save(self, file_path):
+        """Saves the clusterer object to a file."""
+        joblib.dump(self, file_path)
+        print(f"Model saved to {file_path}")
+
+    @staticmethod
+    def load(file_path):
+        """Loads a clusterer object from a file."""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"No such file or directory: '{file_path}'")
+        model = joblib.load(file_path)
+        print(f"Model loaded from {file_path}")
+        return model
 
 if __name__ == '__main__':
-    csv_file = 'servicenow_tickets.csv'
-    # I've chosen 4 clusters based on the sample data categories (login, performance, payment, booking).
-    # You can change this number to see how it affects the clustering.
-    clustered_df = cluster_tickets(csv_file, n_clusters=4)
+    # --- 1. Training and Saving the Model ---
+    print("--- Training Model ---")
+    excel_file = 'generated_incidents.xlsx'
+    try:
+        df = pd.read_excel(excel_file)
+        descriptions = df['Short Description'].tolist()
 
-    if clustered_df is not None:
-        # Generate cluster names
-        cluster_names = generate_cluster_names(clustered_df, n_words=2)
+        # Initialize and train the clusterer
+        clusterer = TicketClusterer(n_clusters=10)
+        df['cluster'] = clusterer.fit_predict(descriptions)
 
-        print("--- Ticket Counts per Cluster ---")
-        # Print counts with names
-        counts = clustered_df['cluster'].value_counts()
-        for cluster_num in counts.index:
+        # Save the trained model
+        model_path = 'ticket_clusterer_model.joblib'
+        clusterer.save(model_path)
+
+        # --- Display Results from Training ---
+        print("\n--- Ticket Counts per Cluster (from training) ---")
+        counts = df['cluster'].value_counts()
+        for cluster_num in sorted(counts.index):
             count = counts[cluster_num]
-            name = cluster_names.get(cluster_num, "Unnamed Cluster")
+            name = clusterer.cluster_names.get(cluster_num, "Unnamed Cluster")
             print(f"Cluster {cluster_num} ({name}): {count} tickets")
 
-        print("\n--- Tickets in each Cluster ---")
-        for cluster_num in sorted(clustered_df['cluster'].unique()):
-            name = cluster_names.get(cluster_num, "Unnamed Cluster")
-            print(f"\n--- Cluster {cluster_num}: {name} ---")
-            cluster_tickets = clustered_df[clustered_df['cluster'] == cluster_num]['short_description'].tolist()
-            for ticket in cluster_tickets:
-                print(f"- {ticket}")
+    except FileNotFoundError:
+        print(f"Error: The file '{excel_file}' was not found. Please create it to run the training.")
+    except Exception as e:
+        print(f"An error occurred during training: {e}")
+
+
+    # --- 2. Loading the Model and Predicting on New Data ---
+    print("\n\n--- Predicting with Loaded Model ---")
+    model_path = 'ticket_clusterer_model.joblib'
+    if os.path.exists(model_path):
+        # Load the saved model
+        loaded_clusterer = TicketClusterer.load(model_path)
+
+        # Example of new, unseen data
+        new_tickets = pd.read_excel('test_incidents.xlsx',sheet_name='test_data')['Short Description'].tolist()
+
+        # Predict the clusters for the new tickets
+        predicted_clusters = loaded_clusterer.predict(new_tickets)
+
+        print("\n--- Predictions for New Tickets ---")
+        for ticket, cluster_num in zip(new_tickets, predicted_clusters):
+            name = loaded_clusterer.cluster_names.get(cluster_num, "Unnamed Cluster")
+            print(f"- '{ticket}' -> Belongs to Cluster {cluster_num} ({name})")
+    else:
+        print("\nModel file not found. Run the training part of the script first.")
